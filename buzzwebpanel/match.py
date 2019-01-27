@@ -1,0 +1,379 @@
+from flask import Blueprint, request, render_template, flash, g, redirect, jsonify, Markup
+
+import steamid
+import buzzwebpanel
+from buzzwebpanel import app, db, BadRequestError, config_setting
+from models import Team, Match, GameServer
+import util
+
+from wtforms import (
+    Form, widgets, validators,
+    StringField, RadioField,
+    SelectField, ValidationError, SelectMultipleField)
+
+match_blueprint = Blueprint('match', __name__)
+
+
+class MultiCheckboxField(SelectMultipleField):
+    widget = widgets.ListWidget(prefix_label=False)
+    option_widget = widgets.CheckboxInput()
+
+
+def different_teams_validator(form, field):
+    if form.team1_id.data == form.team2_id.data:
+        raise ValidationError('Teams cannot be equal')
+
+
+class MatchForm(Form):
+    server_id = SelectField('Server', coerce=int,
+                            validators=[validators.required()])
+
+    match_title = StringField('Match title text',
+                              default='Map {MAPNUMBER} of {MAXMAPS}',
+                              validators=[validators.Length(min=-1, max=Match.title.type.length)])
+
+    series_type = RadioField('Series type',
+                             validators=[validators.required()],
+                             default='bo1',
+                             choices=[
+                                 ('bo1-preset', 'Bo1 with preset map'),
+                                 ('bo1', 'Bo1 with map vetoes'),
+                                 ('bo3', 'Bo3 with map vetoes'),
+                             ])
+
+    team1_id = SelectField('Team 1', coerce=int,
+                           validators=[validators.required()])
+
+    team1_string = StringField('Team 1 title text',
+                               default='',
+                               validators=[validators.Length(min=-1,
+                                                             max=Match.team1_string.type.length)])
+
+    team2_id = SelectField('Team 2', coerce=int,
+                           validators=[validators.required(), different_teams_validator])
+
+    team2_string = StringField('Team 2 title text',
+                               default='',
+                               validators=[validators.Length(min=-1,
+                                                             max=Match.team2_string.type.length)])
+
+    mapchoices = config_setting('MAPLIST')
+    default_mapchoices = config_setting('DEFAULT_MAPLIST')
+    veto_mappool = RadioField('Choose map (if preset)',
+                                      choices=map(lambda name: (
+                                          name, util.format_mapname(
+                                              name)), mapchoices),
+                                      default='de_cache',
+                                      )
+
+    def add_teams(self):
+        if self.team1_id.choices is None:
+            self.team1_id.choices = []
+
+        if self.team2_id.choices is None:
+            self.team2_id.choices = []
+
+        team_ids = []
+        for team in Team.query.filter_by(public_team=True):
+            if team.id not in team_ids:
+                team_ids.append(team.id)
+
+        team_tuples = []
+        for teamid in team_ids:
+            team_tuples.append((teamid, Team.query.get(teamid).name))
+
+        self.team1_id.choices += team_tuples
+        self.team2_id.choices += team_tuples
+
+    def add_servers(self):
+        if self.server_id.choices is None:
+            self.server_id.choices = []
+
+        server_ids = []
+        for s in GameServer.query.all():
+            if not s.in_use:
+                server_ids.append(s.id)
+
+        for s in GameServer.query.filter_by(public_server=True):
+            if not s.in_use and s.id not in server_ids:
+                server_ids.append(s.id)
+
+        server_tuples = []
+        for server_id in server_ids:
+            server_tuples.append(
+                (server_id, GameServer.query.get(server_id).get_display()))
+
+        self.server_id.choices += server_tuples
+
+
+@match_blueprint.route('/match/create', methods=['GET', 'POST'])
+def match_create():
+
+    form = MatchForm(request.form)
+    form.add_teams()
+    form.add_servers()
+
+    if request.method == 'POST':
+        num_matches = Match.query.count()
+        max_matches = config_setting('USER_MAX_MATCHES')
+
+        if max_matches >= 0 and num_matches >= max_matches:
+            flash('You already have the maximum number of matches ({}) created'.format(
+                num_matches))
+
+        if form.validate():
+            mock = config_setting('TESTING')
+
+            server = GameServer.query.get_or_404(form.data['server_id'])
+
+            match_on_server = Match.query.filter_by(
+                server_id=server.id, end_time=None, cancelled=False).first()
+
+            server_avaliable = False
+            json_reply = None
+
+            if match_on_server is not None:
+                server_avaliable = False
+                message = 'Match {} is already using this server'.format(
+                    match_on_server.id)
+            elif mock:
+                server_avaliable = True
+                message = 'Success'
+            else:
+                json_reply, message = util.check_server_avaliability(
+                    server)
+                server_avaliable = (json_reply is not None)
+
+            if server_avaliable:
+                skip_veto = 'preset' in form.data['series_type']
+                try:
+                    max_maps = int(form.data['series_type'][2])
+                except ValueError:
+                    max_maps = 1
+
+                if skip_veto:
+                    match = Match.create(
+                        form.data['team1_id'], form.data['team2_id'],
+                        form.data['team1_string'], form.data['team2_string'],
+                        max_maps, skip_veto, form.data['match_title'],
+                        [form.data['veto_mappool']], form.data['server_id'])
+                else:
+                    match = Match.create(
+                        form.data['team1_id'], form.data['team2_id'],
+                        form.data['team1_string'], form.data['team2_string'],
+                        max_maps, skip_veto, form.data['match_title'],
+                        config_setting('DEFAULT_MAPLIST'), form.data['server_id'])
+
+                # Save plugin version data if we have it
+                if json_reply and 'plugin_version' in json_reply:
+                    match.plugin_version = json_reply['plugin_version']
+                else:
+                    match.plugin_version = 'unknown'
+
+                server.in_use = True
+
+                db.session.commit()
+                app.logger.info('Created match {}, assigned to server {}'
+                                .format(match.id, server.id))
+
+                if mock or match.send_to_server():
+                    return redirect('/matches')
+                else:
+                    flash('Failed to load match configs on server')
+            else:
+                flash(message)
+
+        else:
+            get5.flash_errors(form)
+
+    return render_template(
+        'match_create.html', form=form, teams=Team.query.all(),
+                           match_text_option=config_setting('CREATE_MATCH_TITLE_TEXT'))
+
+
+@match_blueprint.route('/match/<int:matchid>')
+def match(matchid):
+    match = Match.query.get_or_404(matchid)
+    team1 = Team.query.get_or_404(match.team1_id)
+    team2 = Team.query.get_or_404(match.team2_id)
+    map_stat_list = match.map_stats.all()
+
+    is_owner = True
+    has_admin_access = True
+
+    return render_template(
+        'match.html', admin_access=has_admin_access,
+                           match=match, team1=team1, team2=team2,
+                           map_stat_list=map_stat_list)
+
+
+@match_blueprint.route('/match/<int:matchid>/config')
+def match_config(matchid):
+    match = Match.query.get_or_404(matchid)
+    dict = match.build_match_dict()
+    json_text = jsonify(dict)
+    return json_text
+
+
+def admintools_check(match):
+
+    if match.finished():
+        raise BadRequestError('Match already finished')
+
+    if match.cancelled:
+        raise BadRequestError('Match is cancelled')
+
+
+@match_blueprint.route('/match/<int:matchid>/cancel')
+def match_cancel(matchid):
+    match = Match.query.get_or_404(matchid)
+    admintools_check(match)
+
+    match.cancelled = True
+    server = GameServer.query.get(match.server_id)
+    if server:
+        server.in_use = False
+
+    db.session.commit()
+
+    try:
+        server.send_rcon_command('get5_endmatch', raise_errors=True)
+    except util.RconError as e:
+        flash('Failed to cancel match: ' + str(e))
+
+    return redirect('/matches')
+
+
+@match_blueprint.route('/match/<int:matchid>/rcon')
+def match_rcon(matchid):
+    match = Match.query.get_or_404(matchid)
+    admintools_check(match)
+
+    command = request.values.get('command')
+    server = GameServer.query.get_or_404(match.server_id)
+
+    if command:
+        try:
+            rcon_response = server.send_rcon_command(
+                command, raise_errors=True)
+            if rcon_response:
+                rcon_response = Markup(rcon_response.replace('\n', '<br>'))
+            else:
+                rcon_response = 'No output'
+            flash(rcon_response)
+        except util.RconError as e:
+            print(e)
+            flash('Failed to send command: ' + str(e))
+
+    return redirect('/match/{}'.format(matchid))
+
+
+@match_blueprint.route('/match/<int:matchid>/pause')
+def match_pause(matchid):
+    match = Match.query.get_or_404(matchid)
+    admintools_check(match)
+    server = GameServer.query.get_or_404(match.server_id)
+
+    try:
+        server.send_rcon_command('sm_pause', raise_errors=True)
+        flash('Paused match')
+    except util.RconError as e:
+        flash('Failed to send pause command: ' + str(e))
+
+    return redirect('/match/{}'.format(matchid))
+
+
+@match_blueprint.route('/match/<int:matchid>/unpause')
+def match_unpause(matchid):
+    match = Match.query.get_or_404(matchid)
+    admintools_check(match)
+    server = GameServer.query.get_or_404(match.server_id)
+
+    try:
+        server.send_rcon_command('sm_unpause', raise_errors=True)
+        flash('Unpaused match')
+    except util.RconError as e:
+        flash('Failed to send unpause command: ' + str(e))
+
+    return redirect('/match/{}'.format(matchid))
+
+
+@match_blueprint.route('/match/<int:matchid>/adduser')
+def match_adduser(matchid):
+    match = Match.query.get_or_404(matchid)
+    admintools_check(match)
+    server = GameServer.query.get_or_404(match.server_id)
+    team = request.values.get('team')
+    if not team:
+        raise BadRequestError('No team specified')
+
+    auth = request.values.get('auth')
+    suc, new_auth = steamid.auth_to_steam64(auth)
+    if suc:
+        try:
+            command = 'get5_addplayer {} {}'.format(new_auth, team)
+            response = server.send_rcon_command(command, raise_errors=True)
+            flash(response)
+        except util.RconError as e:
+            flash('Failed to send command: ' + str(e))
+
+    else:
+        flash('Invalid steamid: {}'.format(auth))
+
+    return redirect('/match/{}'.format(matchid))
+
+
+# @match_blueprint.route('/match/<int:matchid>/sendconfig')
+# def match_sendconfig(matchid):
+#     match = Match.query.get_or_404(matchid)
+#     admintools_check(g.user, match)
+#     server = GameServer.query.get_or_404(match.server_id)
+
+#     try:
+#         server.send_rcon_command('mp_unpause_match', raise_errors=True)
+#         flash('Unpaused match')
+#     except util.RconError as e:
+#         flash('Failed to send unpause command: ' + str(e))
+
+#     return redirect('/match/{}'.format(matchid))
+
+
+@match_blueprint.route('/match/<int:matchid>/backup', methods=['GET'])
+def match_backup(matchid):
+    match = Match.query.get_or_404(matchid)
+    admintools_check(match)
+    server = GameServer.query.get_or_404(match.server_id)
+    file = request.values.get('file')
+
+    if not file:
+        # List backup files
+        backup_response = server.send_rcon_command(
+            'get5_listbackups ' + str(matchid))
+        if backup_response:
+            backup_files = sorted(backup_response.split('\n'))
+        else:
+            backup_files = []
+
+        return render_template('match_backup.html',
+                               match=match, backup_files=backup_files)
+
+    else:
+        # Restore the backup file
+        command = 'get5_loadbackup {}'.format(file)
+        response = server.send_rcon_command(command)
+        if response:
+            flash('Restored backup file {}'.format(file))
+        else:
+            flash('Failed to restore backup file {}'.format(file))
+            return redirect('match/{}/backup'.format(matchid))
+
+        return redirect('match/{}'.format(matchid))
+
+
+@match_blueprint.route("/matches")
+def matches():
+    page = util.as_int(request.values.get('page'), on_fail=1)
+    matches = Match.query.order_by(-Match.id).filter_by(
+        cancelled=False).paginate(page, 20)
+    return render_template('matches.html', matches=matches,
+                           my_matches=False, all_matches=True, page=page)

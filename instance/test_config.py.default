@@ -1,0 +1,13 @@
+# These must be changed if you want test cases to pass.
+SQLALCHEMY_DATABASE_URI = 'mysql://user:password@host/test_db'
+STEAM_API_KEY = '???'
+
+# These should not be changed.
+DEBUG = False
+TESTING = True
+SQLALCHEMY_TRACK_MODIFICATIONS = False
+SECRET_KEY = 'TOP_SEKRIT'
+USER_MAX_SERVERS = 10
+USER_MAX_TEAMS = 100
+USER_MAX_MATCHES = 1000
+DEFAULT_PAGE = '/matches'

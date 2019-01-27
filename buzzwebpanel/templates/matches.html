@@ -1,0 +1,67 @@
+{% from "macros.html" import pagination_buttons, pagination_active %}
+
+{% extends "layout.html" %}
+{% block content %}
+
+<div id="content">
+
+  <h1>
+  All matches
+  </h1>
+
+  <table class="table table-striped">
+    <thead>
+      <tr>
+        <th>Match ID</th>
+        <th>Team 1</th>
+        <th>Team 2</th>
+        <th>Status</th>
+        <th>Server</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+
+    {% for match in matches.items %}
+      <tr>
+        <td><a href="/match/{{match.id}}"> {{match.id}}</a></td>
+
+        <td>
+          {{ match.get_team1().get_flag_html(0.75) }}
+          <a href="/team/{{match.get_team1().id}}"> {{match.get_team1().name}}</a>
+        </td>
+
+        <td>
+          {{ match.get_team2().get_flag_html(0.75) }}
+          <a href="/team/{{ match.get_team2().id }}"> {{match.get_team2().name}}</a>
+        </td>
+
+        <td>
+          {{ match.get_status_string() }}
+        </td>
+
+        <td>{% if match.get_server() is not none   %} {{ match.get_server().get_display() }} {% endif %}</td>
+        <td>
+          {% if match.pending() or match.live() %}
+          <a href="/match/{{match.id}}/cancel" class="btn btn-danger btn-xs align-right">Cancel</a>
+          {% endif %}
+        </td>
+
+      </tr>
+    {% endfor %}
+
+    </tbody>
+  </table>
+
+  {{ pagination_buttons(matches) }}
+
+</div>
+
+{{ pagination_active(matches) }}
+
+<script>
+    $(document).ready(function () {
+    $("#mymatches").parent().addClass("active"); })
+</script>
+
+{% endblock %}
